@@ -5,13 +5,14 @@ import (
 	"bufio"
 	"crypto/sha1"
 	"encoding/hex"
-	"go.uber.org/zap"
-	"golang.org/x/xerrors"
 	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"go.uber.org/zap"
+	"golang.org/x/xerrors"
 
 	dio "github.com/aquasecurity/go-dep-parser/pkg/io"
 	"github.com/aquasecurity/go-dep-parser/pkg/log"
@@ -75,12 +76,7 @@ func (p *Parser) Parse(r dio.ReadSeekerAt) ([]types.Library, []types.Dependency,
 }
 
 func (p *Parser) parseArtifact(fileName string, size int64, r dio.ReadSeekerAt) ([]types.Library, []types.Dependency, error) {
-	log.Logger.Debugw("Parsing Java artifacts...", zap.String("file", fileName))
-
-	zr, err := zip.NewReader(r, size)
-	if err != nil {
-		return nil, nil, xerrors.Errorf("zip error: %w", err)
-	}
+	log.Logger.Debugw("JJW Parsing Java artifacts...", zap.String("file", fileName))
 
 	// Try to extract artifactId and version from the file name
 	// e.g. spring-core-5.3.4-SNAPSHOT.jar => sprint-core, 5.3.4-SNAPSHOT
@@ -90,16 +86,24 @@ func (p *Parser) parseArtifact(fileName string, size int64, r dio.ReadSeekerAt) 
 	var libs []types.Library
 	var m manifest
 	var foundPomProps bool
+	var props Properties
+	var manifestProps Properties
+	var license string
+	var err error
+
+	zr, err := zip.NewReader(r, size)
+	if err != nil {
+		return nil, nil, xerrors.Errorf("zip error: %w", err)
+	}
 
 	for _, fileInJar := range zr.File {
 		switch {
 		case filepath.Base(fileInJar.Name) == "pom.properties":
-			props, err := parsePomProperties(fileInJar)
+			props, err = parsePomProperties(fileInJar)
+			log.Logger.Debugf("Found in POM: %#v", props)
 			if err != nil {
 				return nil, nil, xerrors.Errorf("failed to parse %s: %w", fileInJar.Name, err)
 			}
-			libs = append(libs, props.Library())
-
 			// Check if the pom.properties is for the original JAR/WAR/EAR
 			if fileProps.ArtifactID == props.ArtifactID && fileProps.Version == props.Version {
 				foundPomProps = true
@@ -109,6 +113,10 @@ func (p *Parser) parseArtifact(fileName string, size int64, r dio.ReadSeekerAt) 
 			if err != nil {
 				return nil, nil, xerrors.Errorf("failed to parse MANIFEST.MF: %w", err)
 			}
+		case strings.Contains(strings.ToLower(filepath.Base(fileInJar.Name)), "license"):
+			//TODO: add license file processing
+			log.Logger.Debugf("license file found")
+			license = ""
 		case isArtifact(fileInJar.Name):
 			innerLibs, _, err := p.parseInnerJar(fileInJar) //TODO process inner deps
 			if err != nil {
@@ -118,14 +126,30 @@ func (p *Parser) parseArtifact(fileName string, size int64, r dio.ReadSeekerAt) 
 			libs = append(libs, innerLibs...)
 		}
 	}
-
+	manifestProps = m.properties()
 	// If pom.properties is found, it should be preferred than MANIFEST.MF.
+	// Check for completeness and supplement it from manifest or license file
+	// If we found license in the pom.properties return
 	if foundPomProps {
+		switch {
+		case props.License != "":
+			log.Logger.Debugf("License found in POM: %#v", props)
+		case manifestProps.License != "":
+			props.License = manifestProps.License
+			log.Logger.Debugf("License found in the manifest: %#v", props)
+		case license != "":
+			props.License = manifestProps.License
+			log.Logger.Debugf("License found in the license file: %#v", props)
+		}
+		libs = append(libs, props.Library())
 		return libs, nil, nil
 	}
 
-	manifestProps := m.properties()
-	if p.offline {
+	// We continue here with the original  logic
+	// TODO: when JavaDB is expanded to store licenses, one extra
+	// case should be added to the switch above
+
+	if p.offline || true {
 		// In offline mode, we will not check if the artifact information is correct.
 		if !manifestProps.Valid() {
 			log.Logger.Debugw("Unable to identify POM in offline mode", zap.String("file", fileName))
@@ -143,8 +167,9 @@ func (p *Parser) parseArtifact(fileName string, size int64, r dio.ReadSeekerAt) 
 		}
 	}
 
+	log.Logger.Debugf("Calling maven central: %#v", manifestProps)
 	// If groupId and artifactId are not found, call Maven Central's search API with SHA-1 digest.
-	props, err := p.searchBySHA1(r)
+	props, err = p.searchBySHA1(r)
 	if err == nil {
 		return append(libs, props.Library()), nil, nil
 	} else if !xerrors.Is(err, ArtifactNotFoundErr) {
@@ -276,6 +301,7 @@ type manifest struct {
 	bundleName             string
 	bundleVersion          string
 	bundleSymbolicName     string
+	bundleLicense          string
 }
 
 func parseManifest(f *zip.File) (manifest, error) {
@@ -287,11 +313,18 @@ func parseManifest(f *zip.File) (manifest, error) {
 
 	var m manifest
 	scanner := bufio.NewScanner(file)
+	var manifestField string
 	for scanner.Scan() {
 		line := scanner.Text()
-
+		// JAR Maifest lines are limited to 72 characters,
+		// content continues in new line that start wihh a single space
+		if strings.HasPrefix(line, " ") {
+			manifestField += strings.TrimSpace(line)
+		} else {
+			manifestField = line
+		}
 		// Skip variables. e.g. Bundle-Name: %bundleName
-		ss := strings.Fields(line)
+		ss := strings.Fields(manifestField)
 		if len(ss) <= 1 || (len(ss) > 1 && strings.HasPrefix(ss[1], "%")) {
 			continue
 		}
@@ -299,26 +332,28 @@ func parseManifest(f *zip.File) (manifest, error) {
 		// It is not determined which fields are present in each application.
 		// In some cases, none of them are included, in which case they cannot be detected.
 		switch {
-		case strings.HasPrefix(line, "Implementation-Version:"):
-			m.implementationVersion = strings.TrimPrefix(line, "Implementation-Version:")
-		case strings.HasPrefix(line, "Implementation-Title:"):
-			m.implementationTitle = strings.TrimPrefix(line, "Implementation-Title:")
-		case strings.HasPrefix(line, "Implementation-Vendor:"):
-			m.implementationVendor = strings.TrimPrefix(line, "Implementation-Vendor:")
-		case strings.HasPrefix(line, "Implementation-Vendor-Id:"):
-			m.implementationVendorId = strings.TrimPrefix(line, "Implementation-Vendor-Id:")
-		case strings.HasPrefix(line, "Specification-Version:"):
-			m.specificationVersion = strings.TrimPrefix(line, "Specification-Version:")
-		case strings.HasPrefix(line, "Specification-Title:"):
-			m.specificationTitle = strings.TrimPrefix(line, "Specification-Title:")
-		case strings.HasPrefix(line, "Specification-Vendor:"):
-			m.specificationVendor = strings.TrimPrefix(line, "Specification-Vendor:")
-		case strings.HasPrefix(line, "Bundle-Version:"):
-			m.bundleVersion = strings.TrimPrefix(line, "Bundle-Version:")
-		case strings.HasPrefix(line, "Bundle-Name:"):
-			m.bundleName = strings.TrimPrefix(line, "Bundle-Name:")
-		case strings.HasPrefix(line, "Bundle-SymbolicName:"):
-			m.bundleSymbolicName = strings.TrimPrefix(line, "Bundle-SymbolicName:")
+		case strings.HasPrefix(manifestField, "Implementation-Version:"):
+			m.implementationVersion = strings.TrimPrefix(manifestField, "Implementation-Version:")
+		case strings.HasPrefix(manifestField, "Implementation-Title:"):
+			m.implementationTitle = strings.TrimPrefix(manifestField, "Implementation-Title:")
+		case strings.HasPrefix(manifestField, "Implementation-Vendor:"):
+			m.implementationVendor = strings.TrimPrefix(manifestField, "Implementation-Vendor:")
+		case strings.HasPrefix(manifestField, "Implementation-Vendor-Id:"):
+			m.implementationVendorId = strings.TrimPrefix(manifestField, "Implementation-Vendor-Id:")
+		case strings.HasPrefix(manifestField, "Specification-Version:"):
+			m.specificationVersion = strings.TrimPrefix(manifestField, "Specification-Version:")
+		case strings.HasPrefix(manifestField, "Specification-Title:"):
+			m.specificationTitle = strings.TrimPrefix(manifestField, "Specification-Title:")
+		case strings.HasPrefix(manifestField, "Specification-Vendor:"):
+			m.specificationVendor = strings.TrimPrefix(manifestField, "Specification-Vendor:")
+		case strings.HasPrefix(manifestField, "Bundle-Version:"):
+			m.bundleVersion = strings.TrimPrefix(manifestField, "Bundle-Version:")
+		case strings.HasPrefix(manifestField, "Bundle-Name:"):
+			m.bundleName = strings.TrimPrefix(manifestField, "Bundle-Name:")
+		case strings.HasPrefix(manifestField, "Bundle-SymbolicName:"):
+			m.bundleSymbolicName = strings.TrimPrefix(manifestField, "Bundle-SymbolicName:")
+		case strings.HasPrefix(manifestField, "Bundle-License:"):
+			m.bundleLicense = strings.TrimPrefix(manifestField, "Bundle-License:")
 		}
 	}
 
@@ -343,11 +378,12 @@ func (m manifest) properties() Properties {
 	if err != nil {
 		return Properties{}
 	}
-
+	// dont fail on the empty license
 	return Properties{
 		GroupID:    groupID,
 		ArtifactID: artifactID,
 		Version:    version,
+		License:    m.bundleLicense,
 	}
 }
 
@@ -364,6 +400,14 @@ func (m manifest) determineGroupID() (string, error) {
 		if idx > 0 {
 			groupID = m.bundleSymbolicName[:idx]
 		}
+	case m.bundleName != "":
+		groupID = m.bundleSymbolicName
+
+		// e.g. "com.fasterxml.jackson.core.jackson-databind" => "com.fasterxml.jackson.core"
+		idx := strings.LastIndex(m.bundleName, ".")
+		if idx > 0 {
+			groupID = m.bundleName[:idx]
+		}
 	case m.implementationVendor != "":
 		groupID = m.implementationVendor
 	case m.specificationVendor != "":
@@ -377,12 +421,16 @@ func (m manifest) determineGroupID() (string, error) {
 func (m manifest) determineArtifactID() (string, error) {
 	var artifactID string
 	switch {
+	case m.bundleName != "":
+		idx := strings.LastIndex(m.bundleName, ".")
+		if idx > 0 {
+			artifactID = m.bundleName[idx+1:]
+		}
 	case m.implementationTitle != "":
 		artifactID = m.implementationTitle
 	case m.specificationTitle != "":
 		artifactID = m.specificationTitle
-	case m.bundleName != "":
-		artifactID = m.bundleName
+
 	default:
 		return "", xerrors.New("no artifactID found")
 	}
